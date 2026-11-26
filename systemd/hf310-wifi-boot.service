@@ -1,0 +1,14 @@
+[Unit]
+Description=HF310 boot Wi-Fi reconnect before captive portal
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=openstick-provision.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hf310-wifi-boot.sh
+TimeoutStartSec=180
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

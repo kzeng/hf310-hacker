@@ -1,0 +1,21 @@
+[Unit]
+Description=HF310 status dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/hf310-dashboard
+EnvironmentFile=/home/user/hf310-dashboard/.env
+ExecStart=/usr/bin/python3 /home/user/hf310-dashboard/app.py
+Restart=always
+RestartSec=3
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/user/hf310-dashboard/data
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

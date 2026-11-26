@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""HF310 配网服务 (captive portal)。
+
+状态机：
+  * 有上行链路（WiFi 客户端 / 蜂窝）  -> 关掉 AP，只留 mDNS + SSH
+  * 没有上行链路                      -> 拉起 AP(192.168.4.1) 并开网页配网
+
+注意：wcn36xx 在 AP 模式下不支持扫描（-95），
+所以必须在拉起 AP 之前先把周围网络扫一次并缓存到磁盘，页面用缓存渲染。
+"""
+import html
+import json
+import os
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+AP_CON = os.environ.get("AP_CON", "hotspot")
+PORT = int(os.environ.get("PORT", "80"))
+SCAN_TTL = 20
+UPLINK_SCAN_INTERVAL = 600       # 有上行时每 10 分钟刷新一次扫描缓存
+AP_SCAN_INTERVAL = 300           # AP 模式下最多每 5 分钟做一次「扫描窗口」
+STARTUP_GRACE = 60               # 开机后先让 NetworkManager 自己连，别急着抢射频
+STA_RETRY_BASE = 120             # AP 模式下重试已知 WiFi 的起始间隔（退避翻倍）
+STA_RETRY_MAX = 100000            # effectively unlimited; keep retrying while AP is up
+CACHE_FILE = "/var/lib/hf310/wifi-scan.json"
+STATE_FILE = "/run/hf310/state.json"
+LOG = "/var/log/openstick-provision.log"
+
+_scan_lock = threading.Lock()
+_scan_cache = {"ts": 0.0, "rows": [], "from_cache": False}
+_ap_ssid = {"value": "Openstick"}
+
+
+def log(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    print(line, flush=True)
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def run(args, timeout=30):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as exc:                                    # noqa: BLE001
+        return 1, "", str(exc)
+
+
+def terse_split(line):
+    """nmcli -t 用 '\\:' 转义冒号，这里按未转义的冒号切分。"""
+    fields, cur, esc = [], [], False
+    for ch in line:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            fields.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    fields.append("".join(cur))
+    return fields
+
+
+def write_state(ap_up, uplink):
+    """给 LED 守护进程看的状态文件（/run/hf310/state.json）。"""
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ap": bool(ap_up), "uplink": bool(uplink),
+                       "connecting": connecting(), "ts": time.time()}, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as exc:
+        log("state write failed: %s" % exc)
+
+
+def active_connections():
+    _, out, _ = run(["nmcli", "-t", "-f", "NAME", "con", "show", "--active"])
+    return {ln for ln in out.splitlines() if ln}
+
+
+def net_state():
+    """返回 (AP 是否激活, 是否已有上行链路)。
+
+    上行链路 = 已连上的 WiFi 客户端连接或蜂窝连接；usb0 共享链路不算。
+    """
+    _, out, _ = run(["nmcli", "-t", "-f", "NAME,TYPE", "con", "show", "--active"])
+    ap, uplink = False, False
+    for line in out.splitlines():
+        name, _, ctype = line.partition(":")
+        if name == AP_CON:
+            ap = True
+        elif ctype in ("802-11-wireless", "gsm", "cdma"):
+            uplink = True
+    return ap, uplink
+
+
+def ap_ssid():
+    if _ap_ssid["value"] == "Openstick":
+        rc, out, _ = run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", AP_CON])
+        if rc == 0 and out.strip():
+            _ap_ssid["value"] = out.strip()
+    return _ap_ssid["value"]
+
+
+def _load_cache():
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("rows", []), float(data.get("ts", 0))
+    except (OSError, ValueError):
+        return [], 0.0
+
+
+def _save_cache(rows):
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "rows": rows}, f)
+    except OSError as exc:
+        log("cache write failed: %s" % exc)
+
+
+def _live_scan():
+    run(["nmcli", "device", "wifi", "rescan"], timeout=25)
+    time.sleep(5)
+    _, out, _ = run(["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY",
+                     "device", "wifi", "list"])
+    own = ap_ssid()
+    rows, seen = [], set()
+    for line in out.splitlines():
+        f = terse_split(line)
+        if len(f) < 4 or not f[1] or f[1] in seen or f[1] == own:
+            continue
+        seen.add(f[1])
+        try:
+            sig = int(f[2])
+        except ValueError:
+            sig = 0
+        rows.append({
+            "ssid": f[1],
+            "signal": sig,
+            "security": ":".join(x for x in f[3:] if x) or "--",
+        })
+    rows.sort(key=lambda r: -r["signal"])
+    return rows
+
+
+def station_connected():
+    """AP 模式下是否已经有客户端连着（有客户端时绝不能拆热点去扫描）。"""
+    rc, out, _ = run(["iw", "dev", "wlan0", "station", "dump"], timeout=10)
+    return rc == 0 and "Station" in out
+
+
+def uptime_seconds():
+    try:
+        with open("/proc/uptime", encoding="ascii") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError):
+        return 1e9
+
+
+def sta_profiles():
+    """已知的、允许自动连接的 WiFi 客户端配置（不含热点），按优先级从高到低。"""
+    rc, out, _ = run(["nmcli", "-t", "-f", "NAME,TYPE,AUTOCONNECT,AUTOCONNECT-PRIORITY",
+                      "con", "show"])
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        f = terse_split(line)
+        if len(f) < 4:
+            continue
+        name, ctype = f[0], f[1]
+        if ctype != "802-11-wireless" or not name or name == AP_CON:
+            continue
+        if f[2].strip() != "yes":
+            continue
+        try:
+            prio = int(f[3])
+        except ValueError:
+            prio = 0
+        rows.append((prio, name))
+    rows.sort(key=lambda r: -r[0])
+    return [n for _, n in rows]
+
+
+def try_known_wifi():
+    """依次尝试已知 WiFi 配置。成功返回 True。
+
+    开机时 NetworkManager 自己也会连，这里是兜底（比如 NM 连失败过一次）。
+    """
+    for name in sta_profiles():
+        log("trying known wifi profile %r" % name)
+        rc, out, err = run(["nmcli", "con", "up", name], timeout=60)
+        if rc == 0:
+            log("known wifi %r connected" % name)
+            return True
+        log("known wifi %r failed rc=%s: %s" % (name, rc, (out + err).strip()[:200]))
+    return False
+
+
+def scan_with_retries(attempts=3, gap=8, min_ok=5):
+    """扫一次往往因为射频刚起来而结果很少，多试几次取最好的。"""
+    best = []
+    for attempt in range(attempts):
+        try:
+            rows = _live_scan()
+        except Exception as exc:                                # noqa: BLE001
+            log("live scan failed: %s" % exc)
+            rows = []
+        if len(rows) > len(best):
+            best = rows
+        if len(best) >= min_ok:
+            break
+        if attempt + 1 < attempts:
+            log("scan thin (%d nets), retrying in %ds" % (len(best), gap))
+            time.sleep(gap)
+    return best
+
+
+def scan_networks(force=False):
+    """返回 (rows, from_cache)。AP 模式下扫不到东西时退回磁盘缓存。"""
+    with _scan_lock:
+        if not force and time.time() - _scan_cache["ts"] < SCAN_TTL:
+            return _scan_cache["rows"], _scan_cache["from_cache"]
+
+        rows = scan_with_retries(attempts=3 if force else 1)
+
+        if rows:
+            _scan_cache.update(ts=time.time(), rows=rows, from_cache=False)
+            _save_cache(rows)
+            log("scan ok: %d networks (cached to disk)" % len(rows))
+        else:
+            rows, ts = _load_cache()
+            _scan_cache.update(ts=ts, rows=rows, from_cache=True)
+            if rows:
+                log("live scan empty (AP mode?) -> using cache, %d networks" % len(rows))
+        return _scan_cache["rows"], _scan_cache["from_cache"]
+
+
+def find_profile_by_ssid(ssid):
+    """找已有的同 SSID 配置，避免每次配网都新建一份。"""
+    rc, out, _ = run(["nmcli", "-t", "-f", "NAME,TYPE", "con", "show"])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        name, _, ctype = line.partition(":")
+        if ctype != "802-11-wireless" or not name or name == AP_CON:
+            continue
+        rc2, cur, _ = run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", name])
+        if rc2 == 0 and cur.strip() == ssid:
+            return name
+    return None
+
+
+def security_of(ssid):
+    """从扫描缓存里查这个 SSID 的加密方式，查不到返回 None。"""
+    for row in _scan_cache["rows"]:
+        if row["ssid"] == ssid:
+            return row["security"]
+    return None
+
+
+def connect_wifi(ssid, password, hidden=False):
+    """不依赖扫描结果：直接建/改连接配置再 up。
+
+    AP 模式下 wcn36xx 无法扫描，用 `nmcli device wifi connect <ssid>`
+    会报 "No network with SSID ... found"，所以必须走这条路。
+    """
+    if not password:
+        sec = security_of(ssid)
+        if sec and any(x in sec.upper() for x in ("WPA", "WEP", "WPA2", "WPA3")):
+            return 4, ("这个网络需要密码（扫描显示加密方式为 %s），请填写密码后重试。"
+                       % sec)
+
+    name = find_profile_by_ssid(ssid)
+    created = False
+    if not name:
+        name = "hf310-" + "".join(
+            c if (c.isalnum() or c in "_.-") else "_" for c in ssid)[:32]
+        rc, out, err = run(["nmcli", "con", "add", "type", "wifi",
+                            "ifname", "wlan0", "con-name", name, "ssid", ssid])
+        if rc != 0:
+            return rc, (out + err).strip()
+        created = True
+
+    if password:
+        rc, out, err = run(["nmcli", "con", "modify", name,
+                            "wifi-sec.key-mgmt", "wpa-psk",
+                            "wifi-sec.psk", password])
+    else:
+        rc, out, err = run(["nmcli", "con", "modify", name,
+                            "wifi-sec.key-mgmt", "none"])
+    if rc != 0:
+        return rc, (out + err).strip()
+
+    if hidden:
+        run(["nmcli", "con", "modify", name, "802-11-wireless.hidden", "yes"])
+    # 关键：明确写盘 autoconnect=yes，否则重启后不会自己连
+    run(["nmcli", "con", "modify", name,
+         "connection.autoconnect", "yes",
+         "connection.autoconnect-priority", "50"])
+    if password:
+        # 密码存到系统侧（而不是等 secret agent 提供），重启后仍然可用
+        run(["nmcli", "con", "modify", name, "wifi-sec.psk-flags", "0"])
+
+    rc, out, err = run(["nmcli", "con", "up", name], timeout=120)
+    if rc != 0 and created:
+        run(["nmcli", "con", "delete", name])
+    return rc, (out + err).strip()
+
+
+CSS = """
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;padding:24px 16px;font:16px/1.6 system-ui,-apple-system,"Noto Sans CJK SC",sans-serif;
+     background:#0f1115;color:#e6e8ee;display:flex;justify-content:center}
+main{width:100%;max-width:520px}
+h1{font-size:1.35rem;margin:0 0 4px}
+p.sub{margin:0 0 18px;color:#9aa3b2;font-size:.9rem}
+.card{background:#171a21;border:1px solid #262b36;border-radius:12px;padding:18px;margin-bottom:16px}
+label{display:block;font-size:.85rem;color:#9aa3b2;margin:12px 0 6px}
+input,select{width:100%;padding:11px 12px;border-radius:9px;border:1px solid #303645;
+             background:#0f1218;color:inherit;font-size:1rem}
+input:focus,select:focus{outline:2px solid #3b82f6;border-color:transparent}
+button{width:100%;margin-top:16px;padding:13px;border:0;border-radius:9px;font-size:1rem;
+       font-weight:600;background:#3b82f6;color:#fff;cursor:pointer}
+button.secondary{background:#2a3140;margin-top:10px}
+.hint{font-size:.8rem;color:#7c8598;margin-top:10px}
+.row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid #232833}
+.row:first-of-type{border-top:0}
+.sig{color:#7c8598;font-size:.8rem;white-space:nowrap}
+.ok{color:#4ade80}.err{color:#f87171}.warn{color:#fbbf24}
+pre{white-space:pre-wrap;word-break:break-all;background:#0f1218;border:1px solid #303645;
+    border-radius:8px;padding:10px;font-size:.8rem;max-height:200px;overflow:auto}
+a{color:#60a5fa}
+"""
+
+
+def page(title, body):
+    return ("<!doctype html><html lang=zh-CN><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>%s</title><style>%s</style></head><body><main>%s</main></body></html>"
+            % (html.escape(title), CSS, body)).encode("utf-8")
+
+
+def render_index(message=""):
+    rows, from_cache = scan_networks()
+
+    opts = ["<option value=''>— 从下面选，或手动输入 —</option>"]
+    listing = []
+    for r in rows:
+        opts.append("<option value='%s'>%s</option>"
+                    % (html.escape(r["ssid"], quote=True),
+                       html.escape("%s (%s dBm)" % (r["ssid"], r["signal"]))))
+        listing.append("<div class=row><span>%s</span><span class=sig>%s dBm · %s</span></div>"
+                       % (html.escape(r["ssid"]), r["signal"], html.escape(r["security"])))
+    if not listing:
+        listing.append("<div class=row><span>列表为空 —— 直接在上面手动输入 WiFi 名称和密码即可</span></div>")
+
+    note = ""
+    if from_cache and rows:
+        note = ("<p class=hint warn>热点模式下无线网卡无法扫描，以上是启动时缓存的结果；"
+                "若列表里没有你的网络，直接在下面手动输入 SSID 即可。</p>")
+
+    msg = ""
+    if message:
+        cls = "ok" if message.startswith("✓") else "err"
+        msg = "<p class='%s'>%s</p>" % (cls, html.escape(message))
+
+    body = """
+<h1>HF310 网络配置</h1>
+<p class=sub>设备当前没有可用网络。填写要连接的 WiFi，连上后本热点会自动关闭。</p>
+<div class=card>
+  <form method=post action=/connect>
+    <label>选择网络</label>
+    <select onchange="document.getElementById('ssid').value=this.value">
+      %s
+    </select>
+    <label>SSID（可手动输入）</label>
+    <input id=ssid name=ssid placeholder="WiFi 名称" autocomplete=off required>
+    <label>密码</label>
+    <input name=password type=password placeholder="开放网络请留空" autocomplete=off>
+    <label style="display:flex;align-items:center;gap:8px;color:#9aa3b2">
+      <input type=checkbox name=hidden value=1 style="width:auto"> 隐藏网络
+    </label>
+    <button type=submit>连接</button>
+    <p class=hint>连接成功后本热点会消失，设备会以新网络重新上线。</p>
+  </form>
+  %s
+</div>
+<div class=card>
+  <label style="margin-top:0">附近的网络</label>
+  %s
+  %s
+  <form method=post action=/rescan><button class=secondary type=submit>重新渲染列表</button></form>
+</div>
+""" % ("\n      ".join(opts), msg, "\n  ".join(listing), note)
+    return page("HF310 配网", body)
+
+
+LAST = {"ssid": "", "ok": None, "detail": ""}
+_CONNECTING = {"until": 0.0}
+
+
+def connecting():
+    return time.time() < _CONNECTING["until"]
+
+
+def connect_async(ssid, password, hidden):
+    _CONNECTING["until"] = time.time() + 90
+
+    def worker():
+        rc, detail = connect_wifi(ssid, password, hidden)
+        LAST.update(ssid=ssid, ok=(rc == 0), detail=detail)
+        log("connect result ssid=%r rc=%s detail=%s"
+            % (ssid, rc, detail.replace("\n", " | ")[:300]))
+        if rc != 0:
+            # 失败：立刻解除保护，让守护进程把热点拉回来
+            _CONNECTING["until"] = 0.0
+    threading.Thread(target=worker, daemon=True).start()
+
+
+PENDING_HTML = """
+<h1>正在连接…</h1>
+<p class=sub>正在尝试连接 <b>%s</b>。热点可能几秒内就关闭，属正常现象。</p>
+<div class=card>
+  <p id=msg>连接中，请稍候…</p>
+  <p class=err id=err></p>
+  <p class=hint>热点消失 → 配网成功，改用新网络访问
+    <a href="http://hf310.local/">http://hf310.local/</a><br>
+    30 秒后热点还在 → 说明密码不对，可返回重试。</p>
+  <a href="/">← 返回配置页</a>
+</div>
+<script>
+let n = 0;
+const t = setInterval(async () => {
+  n++;
+  try {
+    const d = await (await fetch('/status', {cache: 'no-store'})).json();
+    if (d.last && d.last.ok === false) {
+      clearInterval(t);
+      document.getElementById('msg').textContent = '连接失败。';
+      document.getElementById('err').textContent = d.last.detail || '';
+    }
+  } catch (e) { /* 热点已关闭 = 大概率成功 */ }
+  if (n > 20) clearInterval(t);
+}, 2000);
+</script>"""
+
+PROBES = {
+    "/generate_204", "/gen_204", "/hotspot-detect.html",
+    "/library/test/success.html", "/success.txt", "/ncsi.txt",
+    "/connecttest.txt", "/canonical.html", "/redirect",
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "hf310-provision/1.0"
+
+    def log_message(self, fmt, *args):                          # noqa: A003
+        log("%s %s" % (self.address_string(), fmt % args))
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _redirect(self):
+        host = (self.headers.get("Host") or "192.168.4.1").split(":")[0]
+        self.send_response(302)
+        self.send_header("Location", "http://%s/" % host)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):                                           # noqa: N802
+        path = self.path.split("?")[0]
+        if path in PROBES:
+            log("captive probe %s -> redirect" % path)
+            self._redirect()
+            return
+        if path == "/status":
+            ap_up, uplink = net_state()
+            body = ('{"ap":%s,"uplink":%s,"last":{"ssid":%s,"ok":%s,"detail":%s}}'
+                    % ("true" if ap_up else "false",
+                       "true" if uplink else "false",
+                       json.dumps(LAST["ssid"]),
+                       "null" if LAST["ok"] is None else ("true" if LAST["ok"] else "false"),
+                       json.dumps(LAST["detail"]))).encode()
+            self._send(200, body, "application/json")
+            return
+        self._send(200, render_index())
+
+    def do_HEAD(self):                                          # noqa: N802
+        self.do_GET()
+
+    def do_POST(self):                                          # noqa: N802
+        length = min(int(self.headers.get("Content-Length") or 0), 8192)
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        form = parse_qs(raw, keep_blank_values=True)
+        path = self.path.split("?")[0]
+
+        if path == "/rescan":
+            # AP 模式下扫不到东西，这里只是重渲染（会尝试一次实时扫描）
+            self._send(200, render_index())
+            return
+
+        if path != "/connect":
+            self._send(404, b"not found")
+            return
+
+        ssid = (form.get("ssid") or [""])[0].strip()
+        password = (form.get("password") or [""])[0]
+        hidden = "1" in (form.get("hidden") or [])
+        if not ssid:
+            self._send(200, render_index("✗ SSID 不能为空"))
+            return
+
+        log("connect request ssid=%r hidden=%s" % (ssid, hidden))
+        LAST.update(ssid=ssid, ok=None, detail="")
+        connect_async(ssid, password, hidden)
+        self._send(200, page("HF310 配网", PENDING_HTML % html.escape(ssid)))
+
+
+def main():
+    log("provisiond started, watching connection %r" % AP_CON)
+    server = None
+    last_ap_scan = 0.0
+    last_uplink_scan = 0.0
+    last_sta_attempt = 0.0
+    sta_retry_used = 0
+    grace_logged = False
+    while True:
+        try:
+            ap_up, uplink = net_state()
+
+            if uplink and ap_up:
+                log("uplink present -> tearing down AP")
+                run(["nmcli", "con", "down", AP_CON], timeout=60)
+                ap_up = False
+                sta_retry_used = 0
+            elif not ap_up and not uplink and not connecting():
+                up_for = uptime_seconds()
+                if up_for < STARTUP_GRACE:
+                    # 刚开机，NetworkManager 正在自动连，别抢射频
+                    if not grace_logged:
+                        log("boot grace: uptime %.0fs < %ds, waiting for NetworkManager"
+                            % (up_for, STARTUP_GRACE))
+                        grace_logged = True
+                elif (sta_retry_used < STA_RETRY_MAX
+                        and time.time() - last_sta_attempt > 60):
+                    grace_logged = False
+                    last_sta_attempt = time.time()
+                    sta_retry_used += 1
+                    if try_known_wifi():
+                        sta_retry_used = 0
+                        continue
+                else:
+                    grace_logged = False
+                    # AP 模式下无法扫描，先把周围网络扫一遍再拉热点
+                    try:
+                        scan_networks(force=True)
+                    except Exception as exc:                    # noqa: BLE001
+                        log("pre-AP scan failed: %s" % exc)
+                    # 扫描要好几秒，期间 NetworkManager 可能已经连上，
+                    # 必须复查，否则会把刚建立的连接直接踢掉（这就是「重启后又要配网」的根因）
+                    _, up_after_scan = net_state()
+                    if up_after_scan:
+                        log("uplink appeared during pre-AP scan -> skip AP")
+                    else:
+                        log("no uplink and no AP -> activating AP %r" % AP_CON)
+                        rc, out, err = run(["nmcli", "con", "up", AP_CON], timeout=120)
+                        if rc != 0:
+                            log("AP activation failed rc=%s: %s"
+                                % (rc, (out + err).strip()[:300]))
+                        time.sleep(2)
+                        ap_up = AP_CON in active_connections()
+
+            # 有上行链路时（STA 模式）扫描是自由的，顺手刷新缓存
+            if uplink and time.time() - last_uplink_scan > UPLINK_SCAN_INTERVAL:
+                last_uplink_scan = time.time()
+                try:
+                    scan_networks(force=True)
+                except Exception as exc:                        # noqa: BLE001
+                    log("uplink scan failed: %s" % exc)
+
+            # AP 模式自愈：没人连着时按退避重试已知 WiFi（比如开机时路由器还没起来）
+            if (ap_up and not uplink and not connecting()
+                    and sta_retry_used < STA_RETRY_MAX
+                    and time.time() - last_sta_attempt
+                    > min(STA_RETRY_BASE * (2 ** max(sta_retry_used - 1, 0)), 300)
+                    and not station_connected()):
+                last_sta_attempt = time.time()
+                sta_retry_used += 1
+                log("AP idle -> retry known wifi (attempt %d/%d)"
+                    % (sta_retry_used, STA_RETRY_MAX))
+                if try_known_wifi():
+                    sta_retry_used = 0
+
+            # AP 模式下缓存太少时，趁没有客户端连着，短暂拆热点扫一次再拉回来
+            if (ap_up and not uplink
+                    and time.time() - last_ap_scan > AP_SCAN_INTERVAL
+                    and len(_scan_cache["rows"]) < 5
+                    and not station_connected()):
+                last_ap_scan = time.time()
+                log("AP scan cache thin (%d) -> scan window" % len(_scan_cache["rows"]))
+                run(["nmcli", "con", "down", AP_CON], timeout=60)
+                time.sleep(3)
+                try:
+                    rows = scan_with_retries(attempts=3, gap=6)
+                except Exception as exc:                        # noqa: BLE001
+                    log("scan window failed: %s" % exc)
+                    rows = []
+                if rows:
+                    _scan_cache.update(ts=time.time(), rows=rows, from_cache=False)
+                    _save_cache(rows)
+                    log("scan window ok: %d networks" % len(rows))
+                run(["nmcli", "con", "up", AP_CON], timeout=120)
+
+            if ap_up and server is None:
+                try:
+                    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+                except OSError as exc:
+                    log("bind :%d failed: %s" % (PORT, exc))
+                    server = None
+                else:
+                    threading.Thread(target=server.serve_forever, daemon=True).start()
+                    log("AP active -> serving http://192.168.4.1/")
+            elif not ap_up and server is not None:
+                server.shutdown()
+                server.server_close()
+                server = None
+                log("AP down -> stopped http server")
+
+            write_state(ap_up, uplink)
+        except Exception as exc:                                # noqa: BLE001
+            log("loop error: %s" % exc)
+
+        time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()

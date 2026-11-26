@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""HF310 LED 状态指示。
+
+硬件（DT /leds，leds-gpio，高电平点亮）:
+  red:power   GPIO8   默认常亮
+  green:wlan  GPIO7   默认灭
+  blue:wan    GPIO6   默认灭
+
+状态表（红/绿/蓝）:
+  boot         灭 / 慢闪 1Hz / 灭        启动中（红灯此时仍亮，表示有电）
+  online       灭 / 常亮     / 灭        有上行且外网可达
+  no-internet  慢闪 1Hz / 常亮 / 灭      已联机，但外网不通
+  ap           灭 / 蓝绿交替 1Hz         配网模式，热点已开
+  connecting   灭 / 快闪 4Hz / 灭        正在连接 WiFi
+  error        灭 / 灭       / 快闪 4Hz  配网守护进程心跳超时
+"""
+import json
+import os
+import socket
+import threading
+import time
+
+RUN_DIR = "/run/hf310"
+STATE_FILE = os.path.join(RUN_DIR, "state.json")
+STALE_AFTER = 30.0
+TICK = 0.125            # LED 刷新节拍；必须能被闪烁半周期整除，否则会混叠
+STATE_POLL = 1.0        # 状态文件轮询间隔
+
+# 外网可达性探测：直接 TCP 连公共 DNS，不依赖 DNS 解析
+NET_TARGETS = (("223.5.5.5", 53), ("119.29.29.29", 53))
+NET_POLL = 15.0
+NET_TIMEOUT = 3.0
+
+# 逻辑颜色 -> sysfs 路径。
+# 注意：DT 里标的 color 和板子实际颜色不一致，本机实测（2026-11-15）：
+#   red:power  -> 红  (GPIO8)
+#   green:wlan -> 蓝  (GPIO7)   ← DT 标错
+#   blue:wan   -> 绿  (GPIO6)   ← DT 标错
+LED_MAP = {
+    "red": "/sys/class/leds/red:power/brightness",
+    "green": "/sys/class/leds/blue:wan/brightness",
+    "blue": "/sys/class/leds/green:wlan/brightness",
+}
+_last = {"red": None, "green": None, "blue": None}
+_net = {"ok": None}
+
+
+def log(msg):
+    print("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
+
+
+def set_led(name, value):
+    """写 sysfs，1=亮 0=灭；值没变就不写。"""
+    value = 1 if value else 0
+    if _last[name] == value:
+        return
+    try:
+        with open(LED_MAP[name], "w") as f:
+            f.write("%d\n" % value)
+        _last[name] = value
+    except OSError:
+        pass
+
+
+def read_state():
+    """返回 'boot' / 'error' / 状态 dict。"""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return "boot" if not os.path.exists(STATE_FILE) else "error"
+
+    if time.time() - float(data.get("ts", 0)) > STALE_AFTER:
+        return "error"
+    return data
+
+
+def probe_internet():
+    for host, port in NET_TARGETS:
+        try:
+            with socket.create_connection((host, port), timeout=NET_TIMEOUT):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def net_worker():
+    """后台探测外网，不能放在主循环里，否则会卡住闪烁节拍。"""
+    prev = None
+    while True:
+        ok = probe_internet()
+        _net["ok"] = ok
+        if ok != prev:
+            log("internet -> %s" % ("ok" if ok else "unreachable"))
+            prev = ok
+        time.sleep(NET_POLL)
+
+
+def blink(hz):
+    """占空比 50% 的闪烁相位。"""
+    return (time.monotonic() * hz) % 1.0 < 0.5
+
+
+def compute_mode(state):
+    if state == "boot":
+        return "boot"
+    if state == "error":
+        return "error"
+    if state.get("connecting"):
+        return "connecting"
+    if state.get("uplink"):
+        return "online" if _net["ok"] is not False else "no-internet"
+    if state.get("ap"):
+        return "ap"
+    # 既没上行也没 AP，说明正在切换/还没建热点
+    return "boot"
+
+
+def drive(mode):
+    if mode == "online":
+        set_led("red", 0)
+        set_led("green", 1)
+        set_led("blue", 0)
+    elif mode == "no-internet":
+        set_led("red", blink(1))
+        set_led("green", 1)
+        set_led("blue", 0)
+    elif mode == "connecting":
+        set_led("red", 0)
+        set_led("green", blink(4))
+        set_led("blue", 0)
+    elif mode == "ap":
+        # 蓝绿交替：一半周期绿，一半蓝
+        phase = (time.monotonic() * 1.0) % 1.0 < 0.5
+        set_led("red", 0)
+        set_led("green", phase)
+        set_led("blue", not phase)
+    elif mode == "error":
+        set_led("red", 0)
+        set_led("green", 0)
+        set_led("blue", blink(4))
+    else:                                  # boot：红灯亮表示有电
+        set_led("red", 1)
+        set_led("green", blink(1))
+        set_led("blue", 0)
+
+
+def main():
+    log("hf310-ledd started")
+    threading.Thread(target=net_worker, daemon=True).start()
+
+    mode_prev = None
+    mode = "boot"
+    last_poll = 0.0
+    while True:
+        now = time.monotonic()
+
+        if now - last_poll >= STATE_POLL:
+            last_poll = now
+            mode = compute_mode(read_state())
+            if mode != mode_prev:
+                log("mode -> %s" % mode)
+                mode_prev = mode
+
+        drive(mode)
+        time.sleep(TICK)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

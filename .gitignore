@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.log
+*.bin
+*.img
+*.qcow2
+*.tar*
+*.zip
+*.apk
+*.qcn
+*.mbn
+data/
